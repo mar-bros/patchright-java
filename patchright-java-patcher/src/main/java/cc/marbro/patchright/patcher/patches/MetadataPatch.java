@@ -7,6 +7,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Arrays;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Patches Maven POM metadata to rebrand playwright-java as patchright-java.
@@ -18,7 +21,7 @@ import java.nio.file.attribute.BasicFileAttributes;
  */
 public class MetadataPatch {
 
-    public static void apply(Path playwrightPath, String newGroupId, String version) throws IOException {
+    public static void apply(final Path playwrightPath, final String newGroupId, final String version) throws IOException {
 
         // Patch all pom.xml files
         patchPomFiles(playwrightPath, newGroupId);
@@ -31,18 +34,46 @@ public class MetadataPatch {
         }
     }
 
-    private static void patchPomFiles(Path playwrightPath, String newGroupId) throws IOException {
+    private static void patchPomFiles(final Path playwrightPath, final String newGroupId) throws IOException {
+        // {regex, replacement}; EVERY RULE MUST MATCH SOME POM UNLESS AN EARLIER RUN ALREADY APPLIED IT
+        final String[][] rules = {
+                // Replace groupId
+                {Pattern.quote("<groupId>com.microsoft.playwright</groupId>"), "<groupId>" + newGroupId + "</groupId>"},
+                // Replace main artifactId (playwright -> patchright); driver AND driver-bundle KEEP THEIR artifactIds
+                {Pattern.quote("<artifactId>playwright</artifactId>"), "<artifactId>patchright</artifactId>"},
+                // UPDATE NAMES ("Playwright - Main Library", "Playwright Parent Project", ...)
+                {Pattern.quote("<name>Playwright"), "<name>Patchright"},
+                // Update description
+                {"(?<!Undetected )Java library to automate", "Undetected Java library to automate"},
+                // Update URLs
+                {Pattern.quote("https://github.com/microsoft/playwright-java"), "https://github.com/mar-bros/patchright-java"},
+        };
+        final int[] matches = new int[rules.length];
+        final boolean[] applied = new boolean[rules.length];
+
         Files.walkFileTree(playwrightPath, new SimpleFileVisitor<Path>() {
             @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                if (file.getFileName().toString().equals("pom.xml")) {
-                    patchPomFile(file, newGroupId);
+            public FileVisitResult visitFile(final Path file, final BasicFileAttributes attrs) throws IOException {
+                if (!file.getFileName().toString().equals("pom.xml")) return FileVisitResult.CONTINUE;
+
+                final String original = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+                String content = original;
+                for (int i = 0; i < rules.length; i++) {
+                    final Matcher matcher = Pattern.compile(rules[i][0]).matcher(content);
+                    while (matcher.find()) matches[i]++;
+                    content = matcher.replaceAll(Matcher.quoteReplacement(rules[i][1]));
+                    if (content.contains(rules[i][1])) applied[i] = true;
+                }
+
+                if (!content.equals(original)) {
+                    Files.write(file, content.getBytes(StandardCharsets.UTF_8));
+                    System.out.println("  Patched: " + file);
                 }
                 return FileVisitResult.CONTINUE;
             }
 
             @Override
-            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+            public FileVisitResult preVisitDirectory(final Path dir, final BasicFileAttributes attrs) {
                 // Skip hidden directories
                 if (dir.getFileName().toString().startsWith(".")) {
                     return FileVisitResult.SKIP_SUBTREE;
@@ -50,56 +81,11 @@ public class MetadataPatch {
                 return FileVisitResult.CONTINUE;
             }
         });
-    }
 
-    private static void patchPomFile(Path pomPath, String newGroupId) throws IOException {
-        String content = new String(Files.readAllBytes(pomPath), StandardCharsets.UTF_8);
-        String original = content;
-
-        // Replace groupId
-        content = content.replace(
-                "<groupId>com.microsoft.playwright</groupId>",
-                "<groupId>" + newGroupId + "</groupId>");
-
-        // Replace main artifactId (playwright -> patchright)
-        content = content.replace(
-                "<artifactId>playwright</artifactId>",
-                "<artifactId>patchright</artifactId>"
-        );
-
-        // Replace driver-bundle artifactId
-//        content = content.replace(
-//                "<artifactId>driver-bundle</artifactId>",
-//                "<artifactId>patchright-driver-bundle</artifactId>");
-
-        // Replace driver artifactId
-//        content = content.replace(
-//                "<artifactId>driver</artifactId>",
-//                "<artifactId>patchright-driver</artifactId>");
-
-        // Update name and description
-        content = content.replace(
-                "<name>Playwright</name>",
-                "<name>Patchright</name>");
-
-        content = content.replace(
-                "<name>playwright</name>",
-                "<name>patchright</name>");
-
-        // Update description
-        content = content.replace(
-                "Java library to automate",
-                "Undetected Java library to automate");
-
-        // Update URLs
-        content = content.replace(
-                "https://github.com/microsoft/playwright-java",
-                "https://github.com/mar-bros/patchright-java");
-
-        if (!content.equals(original)) {
-            Files.write(pomPath, content.getBytes(StandardCharsets.UTF_8));
-            System.out.println("  Patched: " + pomPath);
-        }
+        for (int i = 0; i < rules.length; i++)
+            if (!applied[i])
+                throw new IllegalStateException("No pom.xml under " + playwrightPath + " matches '" + rules[i][0] + "'");
+        System.out.println("  Metadata rule matches: " + Arrays.toString(matches));
     }
 
     private static void patchVersion(Path playwrightPath, String version) throws IOException {

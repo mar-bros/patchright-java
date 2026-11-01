@@ -1,0 +1,10 @@
+# THE DEFAULT IMAGE IS TOO OLD FOR THE OFFICIAL NODE.JS BINARIES (GLIBC) AND SHIPS MAVEN 3.6.1, BELOW WHAT PLAYWRIGHT'S PLUGINS NEED
+build:
+  image: latest
+# AN UNKNOWN jdk: VALUE SILENTLY FALLS BACK TO JDK 8, SO JDK 25 COMES FROM SDKMAN
+before_install:
+  - sdk install java 25-tem
+  - sdk install maven 3.9.11
+install:
+  - head -n 2 /etc/os-release; ldd --version | head -n 1; true
+  - . "${SDKMAN_DIR:-$HOME/.sdkman}/bin/sdkman-init.sh" && sdk use java 25-tem && sdk use maven 3.9.11 && bash scripts/jitpack.sh

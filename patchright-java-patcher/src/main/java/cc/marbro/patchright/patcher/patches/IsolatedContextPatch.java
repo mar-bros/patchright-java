@@ -15,275 +15,143 @@ import cc.marbro.patchright.patcher.assist.PatchUtil;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * Adds the isolatedContext parameter to all evaluate/evaluateHandle methods.
- * 
+ *
  * This allows users to control whether JavaScript is executed in the main
  * world or an isolated utility world (default: utility/isolated to avoid detection).
- * 
+ *
  * Pattern for implementation classes (e.g., FrameImpl, JSHandleImpl):
  * - Add boolean isolatedContext parameter with default value true
  * - Change "world" property from hardcoded "main" to conditional on isolatedContext
  * - Add overload that delegates with default isolatedContext=true
- * 
+ *
  * Pattern for interface classes (e.g., Frame, JSHandle):
  * - Add new method signature with isolatedContext parameter
  * - Add default method overload without the parameter
- * 
+ *
  * Pattern for delegation classes (e.g., PageImpl, LocatorImpl):
  * - Add isolatedContext parameter and pass through to delegate
  */
 public class IsolatedContextPatch {
 
-    public static void apply(Path playwrightPath) throws IOException {
-        Path implDir = playwrightPath.resolve("playwright/src/main/java/com/microsoft/playwright/impl");
-        Path apiDir = playwrightPath.resolve("playwright/src/main/java/com/microsoft/playwright");
+    private static final String[] METHODS = {"evaluate", "evaluateHandle"};
 
-        // Patch implementation classes that have "world" parameter
-        patchImplClass(implDir.resolve("FrameImpl.java"), "FrameImpl",
-            new String[]{"evaluate", "evaluateHandle"});
-        patchImplClass(implDir.resolve("JSHandleImpl.java"), "JSHandleImpl",
-            new String[]{"evaluate", "evaluateHandle"});
-        patchWorkerImpl(implDir.resolve("WorkerImpl.java"));
+    public static void apply(final Path playwrightPath) throws IOException {
+        final Path implDir = playwrightPath.resolve("playwright/src/main/java/com/microsoft/playwright/impl");
+        final Path apiDir = playwrightPath.resolve("playwright/src/main/java/com/microsoft/playwright");
 
-        // Patch delegation classes
-        patchPageImpl(implDir.resolve("PageImpl.java"));
-        patchLocatorImpl(implDir.resolve("LocatorImpl.java"));
+        // IMPLEMENTATION CLASSES THAT SEND THE evaluateExpression MESSAGE
+        for (final String className: new String[]{"FrameImpl", "JSHandleImpl", "WorkerImpl"})
+            patchImplClass(implDir.resolve(className + ".java"), className);
 
-        // Patch interfaces
-        patchInterface(apiDir.resolve("Frame.java"), "Frame",
-            new String[]{"evaluate", "evaluateHandle"});
-        patchInterface(apiDir.resolve("JSHandle.java"), "JSHandle",
-            new String[]{"evaluate", "evaluateHandle"});
-        patchInterface(apiDir.resolve("Worker.java"), "Worker",
-            new String[]{"evaluate", "evaluateHandle"});
-        patchInterface(apiDir.resolve("Page.java"), "Page",
-            new String[]{"evaluate", "evaluateHandle"});
-        patchLocatorInterface(apiDir.resolve("Locator.java"));
+        // DELEGATION CLASSES
+        for (final String className: new String[]{"PageImpl", "LocatorImpl"})
+            patchDelegationClass(implDir.resolve(className + ".java"), className);
+
+        // PUBLIC API INTERFACES
+        for (final String interfaceName: new String[]{"Frame", "JSHandle", "Worker", "Page", "Locator"})
+            patchInterface(apiDir.resolve(interfaceName + ".java"), interfaceName);
     }
 
-    /**
-     * Patch an implementation class that directly sets params.addProperty("world", "main").
-     * Changes the existing method to accept isolatedContext and use it for world selection.
-     * Adds a backward-compatible overload.
-     */
-    private static void patchImplClass(Path filePath, String className, String[] methodNames) throws IOException {
-        CompilationUnit cu = PatchUtil.parsePreserving(filePath);
+    // ADDS isolatedContext TO THE METHOD BUILDING THE PROTOCOL PARAMS AND SENDS THE WORLD IT SELECTS
+    private static void patchImplClass(final Path filePath, final String className) throws IOException {
+        final CompilationUnit cu = PatchUtil.parsePreserving(filePath);
 
-        for (String methodName : methodNames) {
-            List<MethodDeclaration> methods = cu.findAll(MethodDeclaration.class, m ->
-                m.getNameAsString().equals(methodName) &&
-                m.findAncestor(ClassOrInterfaceDeclaration.class)
-                    .map(c -> c.getNameAsString().equals(className)).orElse(false));
-
-            for (MethodDeclaration method : methods) {
-                if (hasIsolatedContextParam(method)) continue;
-
-                // Add isolatedContext parameter
-                method.addParameter(new Parameter(PrimitiveType.booleanType(), "isolatedContext"));
-
-                // Replace: params.addProperty("world", "main")
-                // With:    params.addProperty("world", isolatedContext ? "utility" : "main")
-                replaceWorldProperty(method);
-
-                // Remove @Override since the original interface method doesn't have this param yet
-                method.getAnnotationByName("Override").ifPresent(a -> a.remove());
-
-                // Add backward-compatible overload
-                ClassOrInterfaceDeclaration parentClass = method.findAncestor(ClassOrInterfaceDeclaration.class).get();
-                addImplOverload(parentClass, method);
-
-                System.out.println("  Patched: " + className + "." + methodName + "()");
+        for (final String methodName: METHODS) {
+            final MethodDeclaration method = target(cu, className, methodName, false);
+            if (method == null) {
+                System.out.println("  SKIP: " + className + "." + methodName + "() already has isolatedContext");
+                continue;
             }
+
+            final NodeList<Statement> stmts = method.getBody().get().getStatements();
+            int expression = -1;
+            int world = -1;
+            for (int i = 0; i < stmts.size(); i++)
+                for (final MethodCallExpr call: stmts.get(i).findAll(MethodCallExpr.class)) {
+                    if (!call.getNameAsString().equals("addProperty") || call.getArguments().size() != 2 || !call.getArgument(0).isStringLiteralExpr())
+                        continue;
+                    final String key = call.getArgument(0).asStringLiteralExpr().getValue();
+                    if (key.equals("expression")) expression = i;
+                    else if (key.equals("world")) world = i;
+                }
+            if (expression < 0)
+                throw new IllegalStateException(className + "." + methodName + "() no longer sets the expression property");
+
+            // REPLACE THE HARDCODED "main" WORLD IN PLACE, OR ADD IT AFTER THE EXPRESSION WHEN ABSENT (WORKERS)
+            final int at = world < 0 ? expression + 1 : world;
+            if (world >= 0) stmts.remove(world);
+            stmts.add(at, StaticJavaParser.parseStatement("params.addProperty(\"world\", isolatedContext ? \"utility\" : \"main\");"));
+            stmts.add(at + 1, StaticJavaParser.parseStatement("params.addProperty(\"isolatedContext\", isolatedContext);"));
+
+            method.addParameter(new Parameter(PrimitiveType.booleanType(), "isolatedContext"));
+            addImplOverload(method);
+            System.out.println("  Patched: " + className + "." + methodName + "()");
         }
 
         PatchUtil.writeCompilationUnit(cu, filePath);
     }
 
-    /**
-     * WorkerImpl doesn't have "world" property, but we still add isolatedContext
-     * to pass through to the protocol.
-     */
-    private static void patchWorkerImpl(Path filePath) throws IOException {
-        CompilationUnit cu = PatchUtil.parsePreserving(filePath);
-        String className = "WorkerImpl";
+    // ADDS isolatedContext TO A METHOD THAT DELEGATES TO ANOTHER evaluate (PageImpl TO mainFrame, LocatorImpl TO THE ELEMENT HANDLE)
+    private static void patchDelegationClass(final Path filePath, final String className) throws IOException {
+        final CompilationUnit cu = PatchUtil.parsePreserving(filePath);
 
-        for (String methodName : new String[]{"evaluate", "evaluateHandle"}) {
-            List<MethodDeclaration> methods = cu.findAll(MethodDeclaration.class, m ->
-                m.getNameAsString().equals(methodName) &&
-                m.findAncestor(ClassOrInterfaceDeclaration.class)
-                    .map(c -> c.getNameAsString().equals(className)).orElse(false));
-
-            for (MethodDeclaration method : methods) {
-                if (hasIsolatedContextParam(method)) continue;
-
-                method.addParameter(new Parameter(PrimitiveType.booleanType(), "isolatedContext"));
-                method.getAnnotationByName("Override").ifPresent(a -> a.remove());
-
-                // Add: params.addProperty("world", isolatedContext ? "utility" : "main");
-                // after the "expression" line
-                method.getBody().ifPresent(body -> {
-                    // Find the position after "expression" addProperty and insert world property
-                    NodeList<Statement> stmts = body.getStatements();
-                    int insertIdx = -1;
-                    for (int i = 0; i < stmts.size(); i++) {
-                        String stmtStr = stmts.get(i).toString();
-                        if (stmtStr.contains("addProperty") && stmtStr.contains("expression")) {
-                            insertIdx = i + 1;
-                            break;
-                        }
-                    }
-                    if (insertIdx >= 0) {
-                        Statement worldStmt = StaticJavaParser.parseStatement(
-                            "params.addProperty(\"world\", isolatedContext ? \"utility\" : \"main\");");
-                        Statement isolatedContextStmt = StaticJavaParser.parseStatement(
-                            "params.addProperty(\"isolatedContext\", isolatedContext);");
-                        stmts.add(insertIdx, worldStmt);
-                        stmts.add(insertIdx + 1, isolatedContextStmt);
-                    }
-                });
-
-                ClassOrInterfaceDeclaration parentClass = method.findAncestor(ClassOrInterfaceDeclaration.class).get();
-                addImplOverload(parentClass, method);
-
-                System.out.println("  Patched: " + className + "." + methodName + "()");
+        for (final String methodName: METHODS) {
+            final MethodDeclaration method = target(cu, className, methodName, false);
+            if (method == null) {
+                System.out.println("  SKIP: " + className + "." + methodName + "() already has isolatedContext");
+                continue;
             }
+
+            // "mainFrame.evaluate(expression, arg)" BECOMES "mainFrame.evaluate(expression, arg, isolatedContext)"
+            final List<MethodCallExpr> calls = method.findAll(MethodCallExpr.class, c -> c.getNameAsString().equals(methodName) && c.getScope().isPresent());
+            if (calls.isEmpty())
+                throw new IllegalStateException(className + "." + methodName + "() no longer delegates to another " + methodName + "()");
+            for (final MethodCallExpr call: calls)
+                call.addArgument(new NameExpr("isolatedContext"));
+
+            method.addParameter(new Parameter(PrimitiveType.booleanType(), "isolatedContext"));
+            addImplOverload(method);
+            System.out.println("  Patched: " + className + "." + methodName + "()");
         }
 
         PatchUtil.writeCompilationUnit(cu, filePath);
     }
 
-    /**
-     * PageImpl delegates to mainFrame - add isolatedContext param and pass through.
-     */
-    private static void patchPageImpl(Path filePath) throws IOException {
-        CompilationUnit cu = PatchUtil.parsePreserving(filePath);
-        String className = "PageImpl";
-
-        for (String methodName : new String[]{"evaluate", "evaluateHandle"}) {
-            List<MethodDeclaration> methods = cu.findAll(MethodDeclaration.class, m ->
-                m.getNameAsString().equals(methodName) &&
-                m.findAncestor(ClassOrInterfaceDeclaration.class)
-                    .map(c -> c.getNameAsString().equals(className)).orElse(false));
-
-            for (MethodDeclaration method : methods) {
-                if (hasIsolatedContextParam(method)) continue;
-
-                method.addParameter(new Parameter(PrimitiveType.booleanType(), "isolatedContext"));
-                method.getAnnotationByName("Override").ifPresent(a -> a.remove());
-
-                // Replace body: delegate to mainFrame with isolatedContext
-                method.getBody().ifPresent(body -> {
-                    String bodyStr = body.toString();
-                    // e.g., "return mainFrame.evaluate(expression, arg);"
-                    // becomes "return mainFrame.evaluate(expression, arg, isolatedContext);"
-                    for (Statement stmt : body.getStatements()) {
-                        stmt.findAll(MethodCallExpr.class).forEach(call -> {
-                            String calledName = call.getNameAsString();
-                            if (calledName.equals(methodName)) {
-                                call.addArgument(new NameExpr("isolatedContext"));
-                            }
-                        });
-                    }
-                });
-
-                ClassOrInterfaceDeclaration parentClass = method.findAncestor(ClassOrInterfaceDeclaration.class).get();
-                addImplOverload(parentClass, method);
-
-                System.out.println("  Patched: " + className + "." + methodName + "()");
-            }
-        }
-
-        PatchUtil.writeCompilationUnit(cu, filePath);
-    }
-
-    /**
-     * LocatorImpl.evaluate delegates to ElementHandle via withElement callback.
-     * We add isolatedContext and pass it through.
-     */
-    private static void patchLocatorImpl(Path filePath) throws IOException {
-        CompilationUnit cu = PatchUtil.parsePreserving(filePath);
-        String className = "LocatorImpl";
-
-        for (String methodName : new String[]{"evaluate", "evaluateHandle"}) {
-            List<MethodDeclaration> methods = cu.findAll(MethodDeclaration.class, m ->
-                m.getNameAsString().equals(methodName) &&
-                m.findAncestor(ClassOrInterfaceDeclaration.class)
-                    .map(c -> c.getNameAsString().equals(className)).orElse(false));
-
-            for (MethodDeclaration method : methods) {
-                if (hasIsolatedContextParam(method)) continue;
-
-                method.addParameter(new Parameter(PrimitiveType.booleanType(), "isolatedContext"));
-                method.getAnnotationByName("Override").ifPresent(a -> a.remove());
-
-                // For evaluate/evaluateHandle: the withElement callback calls h.evaluate/evaluateHandle
-                // For evaluateAll: calls frame.evalOnSelectorAll
-                // Add isolatedContext to those inner calls
-                method.getBody().ifPresent(body -> {
-                    body.findAll(MethodCallExpr.class).forEach(call -> {
-                        String calledName = call.getNameAsString();
-                        if (calledName.equals("evaluate") || calledName.equals("evaluateHandle")
-                            || calledName.equals("evalOnSelectorAll")) {
-                            call.addArgument(new NameExpr("isolatedContext"));
-                        }
-                    });
-                });
-
-                ClassOrInterfaceDeclaration parentClass = method.findAncestor(ClassOrInterfaceDeclaration.class).get();
-                addImplOverload(parentClass, method);
-
-                System.out.println("  Patched: " + className + "." + methodName + "()");
-            }
-        }
-
-        PatchUtil.writeCompilationUnit(cu, filePath);
-    }
-
-    /**
-     * Add isolatedContext to public API interface methods.
-     * Uses text-based replacement to avoid LexicalPreservingPrinter's setDefault() bug.
-     */
-    private static void patchInterface(Path filePath, String interfaceName, String[] methodNames) throws IOException {
+    // TURNS THE ABSTRACT evaluate INTO A DEFAULT OVERLOAD OF A NEW ABSTRACT ONE TAKING isolatedContext
+    // THE AST LOCATES THE DECLARATION BUT THE EDIT IS TEXTUAL, SINCE LexicalPreservingPrinter MISPRINTS setDefault()
+    // REUSING THE ORIGINAL TEXT KEEPS ITS ANNOTATIONS (JSPECIFY @Nullable SINCE 1.63)
+    private static void patchInterface(final Path filePath, final String interfaceName) throws IOException {
         String content = PatchUtil.readFile(filePath);
+        final CompilationUnit cu = StaticJavaParser.parse(content);
 
-        for (String methodName : methodNames) {
-            String returnType = methodName.equals("evaluateHandle") ? "JSHandle" : "Object";
-            String abstractDecl = returnType + " " + methodName + "(String expression, Object arg);";
-            
-            if (content.contains(abstractDecl) && !content.contains(methodName + "(String expression, Object arg, boolean isolatedContext)")) {
-                String newAbstractDecl = returnType + " " + methodName + "(String expression, Object arg, boolean isolatedContext);";
-                String defaultDecl = "default " + returnType + " " + methodName + "(String expression, Object arg) {\n"
-                    + "    return " + methodName + "(expression, arg, true);\n"
-                    + "  }";
-                content = content.replace(abstractDecl, defaultDecl + "\n  " + newAbstractDecl);
-                System.out.println("  Patched interface: " + interfaceName + "." + methodName + "()");
+        for (final String methodName: METHODS) {
+            final MethodDeclaration method = target(cu, interfaceName, methodName, true);
+            if (method == null) {
+                System.out.println("  SKIP: " + interfaceName + "." + methodName + "() already has isolatedContext");
+                continue;
             }
-        }
 
-        PatchUtil.writeFile(filePath, content);
-    }
+            // E.G. "@Nullable Object evaluate(String expression, @Nullable Object arg);"
+            final String decl = method.getTokenRange().get().toString();
+            final int start = content.indexOf(decl);
+            if (start < 0 || start != content.lastIndexOf(decl))
+                throw new IllegalStateException(interfaceName + "." + methodName + "() declaration is not unique in " + filePath.getFileName());
+            final String indent = content.substring(content.lastIndexOf('\n', start) + 1, start);
+            final int paramsEnd = decl.lastIndexOf(')');
 
-    /**
-     * Locator interface has different signature - uses text-based replacement.
-     */
-    private static void patchLocatorInterface(Path filePath) throws IOException {
-        String content = PatchUtil.readFile(filePath);
-        String interfaceName = "Locator";
-
-        for (String methodName : new String[]{"evaluate", "evaluateHandle"}) {
-            String returnType = methodName.equals("evaluateHandle") ? "JSHandle" : "Object";
-            String abstractDecl = returnType + " " + methodName + "(String expression, Object arg, EvaluateOptions options);";
-
-            if (content.contains(abstractDecl) && !content.contains(methodName + "(String expression, Object arg, EvaluateOptions options, boolean isolatedContext)")) {
-                String newAbstractDecl = returnType + " " + methodName + "(String expression, Object arg, EvaluateOptions options, boolean isolatedContext);";
-                String defaultDecl = "default " + returnType + " " + methodName + "(String expression, Object arg, EvaluateOptions options) {\n"
-                    + "    return " + methodName + "(expression, arg, options, true);\n"
-                    + "  }";
-                content = content.replace(abstractDecl, defaultDecl + "\n  " + newAbstractDecl);
-                System.out.println("  Patched interface: " + interfaceName + "." + methodName + "()");
-            }
+            final StringBuilder args = new StringBuilder();
+            for (final Parameter param: method.getParameters())
+                args.append(param.getNameAsString()).append(", ");
+            final String defaultDecl = "default " + decl.substring(0, paramsEnd + 1) + " {\n"
+                + indent + "  return " + methodName + "(" + args + "true);\n"
+                + indent + "}";
+            final String newAbstractDecl = decl.substring(0, paramsEnd) + ", boolean isolatedContext" + decl.substring(paramsEnd);
+            content = content.substring(0, start) + defaultDecl + "\n" + indent + newAbstractDecl + content.substring(start + decl.length());
+            System.out.println("  Patched interface: " + interfaceName + "." + methodName + "()");
         }
 
         PatchUtil.writeFile(filePath, content);
@@ -291,82 +159,46 @@ public class IsolatedContextPatch {
 
     // --- Helper methods ---
 
-    private static boolean hasIsolatedContextParam(MethodDeclaration method) {
-        return method.getParameters().stream()
-            .anyMatch(p -> p.getNameAsString().equals("isolatedContext"));
+    // RETURNS THE ONLY UPSTREAM DECLARATION TO PATCH, OR NULL WHEN AN isolatedContext VARIANT ALREADY EXISTS
+    private static MethodDeclaration target(final CompilationUnit cu, final String typeName, final String methodName, final boolean bodyless) {
+        final ClassOrInterfaceDeclaration type = cu.findFirst(ClassOrInterfaceDeclaration.class, c -> c.getNameAsString().equals(typeName))
+            .orElseThrow(() -> new IllegalStateException(typeName + " not found"));
+        final List<MethodDeclaration> methods = type.getMethodsByName(methodName).stream()
+            .filter(m -> m.getBody().isPresent() != bodyless)
+            .collect(Collectors.toList());
+        for (final MethodDeclaration method: methods)
+            if (method.getParameterByName("isolatedContext").isPresent()) return null;
+        if (methods.size() != 1)
+            throw new IllegalStateException("Expected one " + (bodyless ? "abstract " : "") + typeName + "." + methodName + "(), found " + methods.size());
+        return methods.get(0);
     }
 
-    /**
-     * Replace params.addProperty("world", "main") with
-     * params.addProperty("world", isolatedContext ? "utility" : "main")
-     */
-    private static void replaceWorldProperty(MethodDeclaration method) {
-        method.getBody().ifPresent(body -> {
-            NodeList<Statement> stmts = body.getStatements();
-            int insertIdx = -1;
-            for (int i = 0; i < stmts.size(); i++) {
-                Statement stmt = stmts.get(i);
-                boolean foundWorld = false;
-                for (MethodCallExpr call : stmt.findAll(MethodCallExpr.class)) {
-                    if (call.getNameAsString().equals("addProperty") && call.getArguments().size() == 2) {
-                        Expression firstArg = call.getArgument(0);
-                        if (firstArg.isStringLiteralExpr() &&
-                            firstArg.asStringLiteralExpr().getValue().equals("world")) {
-                            // Replace second argument with conditional
-                            call.setArgument(1, new ConditionalExpr(
-                                new NameExpr("isolatedContext"),
-                                new StringLiteralExpr("utility"),
-                                new StringLiteralExpr("main")
-                            ));
-                            foundWorld = true;
-                        }
-                    }
-                }
-                if (foundWorld) {
-                    insertIdx = i + 1;
-                    break;
-                }
-            }
-            if (insertIdx >= 0) {
-                body.getStatements().add(insertIdx, StaticJavaParser.parseStatement("params.addProperty(\"isolatedContext\", isolatedContext);"));
-            }
-        });
-    }
-
-    /**
-     * Add a backward-compatible overload that calls the new method with isolatedContext=true.
-     */
-    private static void addImplOverload(ClassOrInterfaceDeclaration parentClass, MethodDeclaration patchedMethod) {
-        MethodDeclaration overload = new MethodDeclaration();
+    // ADDS A BACKWARD-COMPATIBLE OVERLOAD THAT CALLS THE PATCHED METHOD WITH isolatedContext=true
+    private static void addImplOverload(final MethodDeclaration patchedMethod) {
+        final ClassOrInterfaceDeclaration parentClass = patchedMethod.findAncestor(ClassOrInterfaceDeclaration.class).get();
+        final MethodDeclaration overload = new MethodDeclaration();
         overload.setName(patchedMethod.getNameAsString());
         overload.setType(patchedMethod.getType().clone());
         overload.addAnnotation("Override");
         overload.setModifiers(Modifier.Keyword.PUBLIC);
 
         // Copy all parameters except isolatedContext
-        for (Parameter param : patchedMethod.getParameters()) {
-            if (!param.getNameAsString().equals("isolatedContext")) {
-                overload.addParameter(param.clone());
-            }
-        }
+        for (final Parameter param: patchedMethod.getParameters())
+            if (!param.getNameAsString().equals("isolatedContext")) overload.addParameter(param.clone());
 
         // Create body: return this.methodName(param1, param2, ..., true);
-        BlockStmt body = new BlockStmt();
-        MethodCallExpr call = new MethodCallExpr(patchedMethod.getNameAsString());
-        for (Parameter param : overload.getParameters()) {
+        final BlockStmt body = new BlockStmt();
+        final MethodCallExpr call = new MethodCallExpr(patchedMethod.getNameAsString());
+        for (final Parameter param: overload.getParameters())
             call.addArgument(new NameExpr(param.getNameAsString()));
-        }
         call.addArgument(new BooleanLiteralExpr(true)); // default isolatedContext = true
 
-        if (patchedMethod.getType().isVoidType()) {
-            body.addStatement(new ExpressionStmt(call));
-        } else {
-            body.addStatement(new ReturnStmt(call));
-        }
+        if (patchedMethod.getType().isVoidType()) body.addStatement(new ExpressionStmt(call));
+        else body.addStatement(new ReturnStmt(call));
         overload.setBody(body);
 
         // Add after the patched method
-        int idx = parentClass.getMembers().indexOf(patchedMethod);
+        final int idx = parentClass.getMembers().indexOf(patchedMethod);
         parentClass.getMembers().add(idx + 1, overload);
     }
 }

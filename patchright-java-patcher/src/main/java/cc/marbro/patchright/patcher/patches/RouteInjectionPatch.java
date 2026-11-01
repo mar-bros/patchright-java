@@ -29,20 +29,19 @@ import java.util.List;
  */
 public class RouteInjectionPatch {
 
-    public static void apply(Path playwrightPath) throws IOException {
-        Path implDir = playwrightPath.resolve("playwright/src/main/java/com/microsoft/playwright/impl");
+    public static void apply(final Path playwrightPath) throws IOException {
+        final Path implDir = playwrightPath.resolve("playwright/src/main/java/com/microsoft/playwright/impl");
 
         patchBrowserContextImpl(implDir.resolve("BrowserContextImpl.java"));
         patchPageImpl(implDir.resolve("PageImpl.java"));
         patchClockImpl(implDir.resolve("ClockImpl.java"));
-        patchTracingImpl(implDir.resolve("TracingImpl.java"));
+        patchTracingImpl(implDir);
     }
 
-    private static void patchBrowserContextImpl(Path filePath) throws IOException {
-        CompilationUnit cu = PatchUtil.parsePreserving(filePath);
+    private static void patchBrowserContextImpl(final Path filePath) throws IOException {
+        final CompilationUnit cu = PatchUtil.parsePreserving(filePath);
 
-        ClassOrInterfaceDeclaration clazz = cu.findAll(ClassOrInterfaceDeclaration.class, c ->
-            c.getNameAsString().equals("BrowserContextImpl")).get(0);
+        final ClassOrInterfaceDeclaration clazz = requireClass(cu, "BrowserContextImpl");
 
         if (hasField(clazz, "routeInjecting")) {
             System.out.println("  SKIP: BrowserContextImpl already patched");
@@ -70,11 +69,10 @@ public class RouteInjectionPatch {
         System.out.println("  Patched: BrowserContextImpl (route injection)");
     }
 
-    private static void patchPageImpl(Path filePath) throws IOException {
-        CompilationUnit cu = PatchUtil.parsePreserving(filePath);
+    private static void patchPageImpl(final Path filePath) throws IOException {
+        final CompilationUnit cu = PatchUtil.parsePreserving(filePath);
 
-        ClassOrInterfaceDeclaration clazz = cu.findAll(ClassOrInterfaceDeclaration.class, c ->
-            c.getNameAsString().equals("PageImpl")).get(0);
+        final ClassOrInterfaceDeclaration clazz = requireClass(cu, "PageImpl");
 
         if (hasField(clazz, "routeInjecting")) {
             System.out.println("  SKIP: PageImpl already patched");
@@ -99,61 +97,34 @@ public class RouteInjectionPatch {
         System.out.println("  Patched: PageImpl (route injection)");
     }
 
-    private static void patchClockImpl(Path filePath) throws IOException {
-        if (!filePath.toFile().exists()) {
-            System.out.println("  SKIP: ClockImpl.java not found");
-            return;
-        }
+    private static void patchClockImpl(final Path filePath) throws IOException {
+        final CompilationUnit cu = PatchUtil.parsePreserving(filePath);
 
-        CompilationUnit cu = PatchUtil.parsePreserving(filePath);
-
-        // Find install() method and inject route call
-        List<MethodDeclaration> installMethods = cu.findAll(MethodDeclaration.class, m ->
-            m.getNameAsString().equals("install"));
-
-        for (MethodDeclaration method : installMethods) {
-            method.getBody().ifPresent(body -> {
-                String bodyStr = body.toString();
-                if (!bodyStr.contains("installInjectRoute")) {
-                    // browserContext field is declared as ChannelOwner, must cast
-                    Statement stmt = StaticJavaParser.parseStatement(
-                        "((BrowserContextImpl) browserContext).installInjectRoute();");
-                    body.getStatements().addFirst(stmt);
-                }
-            });
-        }
+        // browserContext field is declared as ChannelOwner, must cast
+        injectCallAtMethodStart(requireClass(cu, "ClockImpl"), "install",
+            "((BrowserContextImpl) browserContext).installInjectRoute();", null);
 
         PatchUtil.writeCompilationUnit(cu, filePath);
         System.out.println("  Patched: ClockImpl (route injection)");
     }
 
-    private static void patchTracingImpl(Path filePath) throws IOException {
-        if (!filePath.toFile().exists()) {
-            System.out.println("  SKIP: TracingImpl.java not found");
-            return;
-        }
+    // TRACING MAY ALSO BELONG TO A STANDALONE APIRequestContext, SO THE CURRENT PARENT IS CHECKED ON EACH start()
+    // THE PARENT CHANGES WHEN THE CONTEXT ADOPTS ITS TRACING, SO IT CAN'T BE CAPTURED IN THE CONSTRUCTOR;
+    // ChannelOwner.parent GETS PACKAGE-PRIVATE TO BE READABLE FROM TracingImpl
+    private static void patchTracingImpl(final Path implDir) throws IOException {
+        final Path ownerPath = implDir.resolve("ChannelOwner.java");
+        final CompilationUnit owner = PatchUtil.parsePreserving(ownerPath);
+        requireClass(owner, "ChannelOwner").getFieldByName("parent")
+            .orElseThrow(() -> new IllegalStateException("ChannelOwner.parent not found in " + ownerPath))
+            .removeModifier(Modifier.Keyword.PRIVATE);
+        PatchUtil.writeCompilationUnit(owner, ownerPath);
 
-        CompilationUnit cu = PatchUtil.parsePreserving(filePath);
+        final Path tracingPath = implDir.resolve("TracingImpl.java");
+        final CompilationUnit cu = PatchUtil.parsePreserving(tracingPath);
+        injectCallAtMethodStart(requireClass(cu, "TracingImpl"), "start",
+            "if (parent instanceof BrowserContextImpl) { ((BrowserContextImpl) parent).installInjectRoute(); }", null);
 
-        // Find start/startChunk methods and inject route call
-        for (String methodName : new String[]{"startImpl", "startChunkImpl"}) {
-            List<MethodDeclaration> methods = cu.findAll(MethodDeclaration.class, m ->
-                m.getNameAsString().equals(methodName));
-
-            for (MethodDeclaration method : methods) {
-                method.getBody().ifPresent(body -> {
-                    String bodyStr = body.toString();
-                    if (!bodyStr.contains("installInjectRoute")) {
-                        // Cast parent to BrowserContextImpl and call
-                        Statement stmt = StaticJavaParser.parseStatement(
-                            "((BrowserContextImpl) parent).installInjectRoute();");
-                        body.getStatements().addFirst(stmt);
-                    }
-                });
-            }
-        }
-
-        PatchUtil.writeCompilationUnit(cu, filePath);
+        PatchUtil.writeCompilationUnit(cu, tracingPath);
         System.out.println("  Patched: TracingImpl (route injection)");
     }
 
@@ -228,21 +199,24 @@ public class RouteInjectionPatch {
         boolean test(MethodDeclaration m);
     }
 
-    private static void injectCallAtMethodStart(ClassOrInterfaceDeclaration clazz,
-                                                 String methodName, String statement,
-                                                 MethodFilter extraFilter) {
-        List<MethodDeclaration> methods = clazz.findAll(MethodDeclaration.class, m ->
-            m.getNameAsString().equals(methodName) &&
+    private static void injectCallAtMethodStart(final ClassOrInterfaceDeclaration clazz,
+                                                 final String methodName, final String statement,
+                                                 final MethodFilter extraFilter) {
+        final List<MethodDeclaration> methods = clazz.findAll(MethodDeclaration.class, m ->
+            m.getNameAsString().equals(methodName) && m.getBody().isPresent() &&
             (extraFilter == null || extraFilter.test(m)));
+        if (methods.isEmpty())
+            throw new IllegalStateException(clazz.getNameAsString() + "." + methodName + "() not found");
 
-        for (MethodDeclaration method : methods) {
-            method.getBody().ifPresent(body -> {
-                String bodyStr = body.toString();
-                if (!bodyStr.contains("installInjectRoute")) {
-                    Statement stmt = StaticJavaParser.parseStatement(statement);
-                    body.getStatements().addFirst(stmt);
-                }
-            });
+        for (final MethodDeclaration method: methods) {
+            final BlockStmt body = method.getBody().get();
+            if (!body.toString().contains("installInjectRoute"))
+                body.getStatements().addFirst(StaticJavaParser.parseStatement(statement));
         }
+    }
+
+    private static ClassOrInterfaceDeclaration requireClass(final CompilationUnit cu, final String className) {
+        return cu.getClassByName(className)
+            .orElseThrow(() -> new IllegalStateException(className + " not found"));
     }
 }

@@ -41,17 +41,6 @@ public class PatchUtil {
     }
 
     /**
-     * Simple text replacement in a file.
-     */
-    public static void replaceInFile(Path filePath, String target, String replacement) throws IOException {
-        String content = new String(Files.readAllBytes(filePath), StandardCharsets.UTF_8);
-        if (content.contains(target)) {
-            content = content.replace(target, replacement);
-            Files.write(filePath, content.getBytes(StandardCharsets.UTF_8));
-        }
-    }
-
-    /**
      * Read file content as string.
      */
     public static String readFile(Path filePath) throws IOException {

@@ -3,9 +3,11 @@ package cc.marbro.patchright.patcher.patches;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.Modifier;
+import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
-import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.MarkerAnnotationExpr;
+import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import cc.marbro.patchright.patcher.assist.PatchUtil;
 
@@ -29,35 +31,42 @@ import java.util.List;
  */
 public class FocusControlPatch {
 
-    public static void apply(Path playwrightPath) throws IOException {
-        Path apiDir = playwrightPath.resolve("playwright/src/main/java/com/microsoft/playwright");
-        Path implDir = apiDir.resolve("impl");
+    public static void apply(final Path playwrightPath) throws IOException {
+        final Path apiDir = playwrightPath.resolve("playwright/src/main/java/com/microsoft/playwright");
+        final Path implDir = apiDir.resolve("impl");
 
         // Add focusControl field to Options classes
         addFocusControlToOptions(apiDir.resolve("BrowserType.java"), new String[]{"LaunchOptions", "LaunchPersistentContextOptions"});
         addFocusControlToOptions(apiDir.resolve("Browser.java"), new String[]{"NewContextOptions", "NewPageOptions"});
 
-        // Patch impl classes to pass focusControl to protocol
-        patchBrowserTypeImpl(implDir.resolve("BrowserTypeImpl.java"));
-        patchBrowserImplNewContext(implDir.resolve("BrowserImpl.java"));
+        // THE IMPLS NEED NO CHANGE WHILE GSON SERIALIZES THE WHOLE OPTIONS OBJECT, PUBLIC focusControl INCLUDED
+        // (NewPageOptions REACHES newContext THROUGH A GSON-BASED convertType)
+        requireGsonOptions(implDir.resolve("BrowserTypeImpl.java"), "BrowserTypeImpl", "launch", "launchPersistentContext");
+        requireGsonOptions(implDir.resolve("BrowserImpl.java"), "BrowserImpl", "newContext");
     }
 
     /**
      * Add focusControl field + setter to Options inner classes.
      */
-    private static void addFocusControlToOptions(Path filePath, String[] classNames) throws IOException {
-        CompilationUnit cu = PatchUtil.parsePreserving(filePath);
+    private static void addFocusControlToOptions(final Path filePath, final String[] classNames) throws IOException {
+        final CompilationUnit cu = PatchUtil.parsePreserving(filePath);
+        // SINCE 1.63 THE OPTIONS FIELDS ARE JSPECIFY @Nullable INSIDE A @NullMarked PACKAGE
+        final boolean jspecify = cu.getImports().stream()
+                .anyMatch(i -> i.getNameAsString().equals("org.jspecify.annotations.Nullable"));
 
-        for (String className : classNames) {
-            List<ClassOrInterfaceDeclaration> classes = cu.findAll(ClassOrInterfaceDeclaration.class,
+        for (final String className: classNames) {
+            final List<ClassOrInterfaceDeclaration> classes = cu.findAll(ClassOrInterfaceDeclaration.class,
                     c -> c.getNameAsString().equals(className));
+            if (classes.isEmpty())
+                throw new IllegalStateException(className + " not found in " + filePath.getFileName());
 
-            for (ClassOrInterfaceDeclaration clazz : classes) {
+            for (final ClassOrInterfaceDeclaration clazz: classes) {
                 if (hasField(clazz, "focusControl")) continue;
 
                 // Add field: public Boolean focusControl;
-                FieldDeclaration field = clazz.addField(
-                        new ClassOrInterfaceType(null, "Boolean"), "focusControl", Modifier.Keyword.PUBLIC);
+                final ClassOrInterfaceType type = new ClassOrInterfaceType(null, "Boolean");
+                if (jspecify) type.setAnnotations(new NodeList<>(new MarkerAnnotationExpr("Nullable")));
+                clazz.addField(type, "focusControl", Modifier.Keyword.PUBLIC);
 
                 // Add setter method
                 String setterBody = String.join("\n",
@@ -76,40 +85,20 @@ public class FocusControlPatch {
         PatchUtil.writeCompilationUnit(cu, filePath);
     }
 
-    /**
-     * Patch BrowserTypeImpl to include focusControl in protocol params for launch methods.
-     */
-    private static void patchBrowserTypeImpl(Path filePath) throws IOException {
-        if (!filePath.toFile().exists()) {
-            System.out.println("  SKIP: BrowserTypeImpl.java not found");
-            return;
+    // FAILS WHEN A METHOD NO LONGER SERIALIZES ITS OPTIONS WITH toJsonTree(options), WHICH WOULD DROP focusControl
+    private static void requireGsonOptions(final Path filePath, final String className, final String... methodNames) throws IOException {
+        final CompilationUnit cu = StaticJavaParser.parse(filePath);
+        for (final String methodName: methodNames) {
+            final boolean serialized = cu.findAll(MethodDeclaration.class, m ->
+                    m.getNameAsString().equals(methodName)
+                    && m.findAncestor(ClassOrInterfaceDeclaration.class).map(c -> c.getNameAsString().equals(className)).orElse(false))
+                .stream()
+                .flatMap(m -> m.findAll(MethodCallExpr.class, c -> c.getNameAsString().equals("toJsonTree")).stream())
+                .anyMatch(c -> c.getArguments().size() == 1 && c.getArgument(0).toString().equals("options"));
+            if (!serialized)
+                throw new IllegalStateException(className + "." + methodName + "() no longer serializes options via toJsonTree(options), focusControl would be dropped");
+            System.out.println("  " + className + "." + methodName + "(): focusControl auto-serialized by Gson (no code change needed)");
         }
-
-        // Use text-based patching since the serialization is via gson().toJsonTree(options)
-        // and focusControl will be automatically serialized as part of the options object.
-        // However, we need to verify this is the case.
-        // playwright-java serializes options via: JsonObject params = gson().toJsonTree(options).getAsJsonObject();
-        // Since focusControl is a public field on the options class, Gson will automatically include it.
-        // So no code change is needed here for the impl - Gson handles it!
-
-        System.out.println("  BrowserTypeImpl: focusControl auto-serialized by Gson (no code change needed)");
-    }
-
-    /**
-     * Patch BrowserImpl.newContext to pass focusControl.
-     * Same as BrowserTypeImpl - Gson auto-serializes the public field.
-     */
-    private static void patchBrowserImplNewContext(Path filePath) throws IOException {
-        if (!filePath.toFile().exists()) {
-            System.out.println("  SKIP: BrowserImpl.java not found");
-            return;
-        }
-
-        // playwright-java uses: JsonObject params = gson().toJsonTree(options).getAsJsonObject();
-        // Since focusControl is added as a public field to NewContextOptions,
-        // Gson will automatically serialize it. No implementation change needed!
-
-        System.out.println("  BrowserImpl: focusControl auto-serialized by Gson (no code change needed)");
     }
 
     private static boolean hasField(ClassOrInterfaceDeclaration clazz, String name) {

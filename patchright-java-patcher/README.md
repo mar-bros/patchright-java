@@ -8,7 +8,7 @@
 
 具体应用的代码 Patch（改造）内容主要包含如下六类：
 
-- **Driver Patch（驱动替换）**：拦截源码底层的 Driver 下载逻辑，将其下载 URL 指针从官方 Playwright 驱动切换为包含无头防侦测补丁的开源 **Patchright Driver** 构建产物。
+- **Driver Patch（驱动替换）**：拦截源码底层的 Driver 下载逻辑，将其下载 URL 指针从官方 Playwright 驱动切换为包含无头防侦测补丁的开源 **Patchright Driver** 构建产物（旧版下载脚本改写为 Patchright Release 的 zip 地址；1.63 起上游改用 `npm pack playwright-core`，则改为打包 npm 上的 `patchright-core`）。
 - **Script Injection Patch（脚本特征清理）**：移除 Playwright 在注入 JavaScript 代码时默认携带的 `sourceURL` 和其他调试注释尾巴。这阻止了反爬机制通过跟踪代码来源或浏览栈信息探知自动化脚本的存在。
 - **Isolated Context Patch（隔离执行环境）**：这是对抗检测最核心的改造。工具为 `Frame`、`JSHandle`、`Page`、`Locator` 等核心 API 的所有 `evaluate` 及 `evaluateHandle` 系列方法自动注入了名为 `isolatedContext` 的新参。当该参数生效（默认开启）时，底层的 JS 调用的 `world` 环境会从 `'main'` 强制切换至 `'utility'`。这使得业务侧的 JS 操作都在浏览器隔离的沙盒节点中执行，**彻底规避了最易暴露的 `Runtime.enable` 特征检测点**。
 - **Route Injection Patch（路由注入）**：通过接管底层请求，安装并隐式绑定拦截路由，实现在每个 Document 请求建立前，静默执行一系列环境欺骗和特征抹除的 InitScript。
@@ -29,6 +29,6 @@ Patchright Java 的核心适配目标是 1:1 对标 `patchright`（Node.js / Pyt
 
 在 Python 版本的实现（如 [`patch_python_package.py`](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python/blob/main/patch_python_package.py)）中，代码主要依靠预设目标数组的匹配断言（Assert 替换命中次数）来检查修改是否发生了遗漏。Java 版的 Patcher 一方面沿用了类似的监控防漏思想，另一方面由于 Java 的天然属性获得了更严谨的防漏墙：
 
-1. **AST 结构化捕获命中率检查**：Patcher 会使用 `JavaParser` 在全局范围内扫描特定“接口契约”（如所有的 `evaluate`、`evalOnSelector` 声明）。如果上游 `playwright-java` 的内部架构发生破坏性变更，使得 Patcher 无法全量匹配预设的 AST 节点，在执行构建和替换期间会直观地显示其漏配甚至抛异预警。
+1. **AST 结构化捕获命中率检查**：Patcher 会使用 `JavaParser` 在全局范围内扫描特定“接口契约”（如所有的 `evaluate`、`evalOnSelector` 声明）。如果上游 `playwright-java` 的内部架构发生破坏性变更，使得 Patcher 无法全量匹配预设的 AST 节点或文本替换未命中任何内容，Patcher 会直接抛出 `IllegalStateException`（注明文件与目标）并以非 0 退出码终止构建，避免发布未隐身的产物；已打过补丁的目标会被识别并跳过，因此重复运行是安全的。
 2. **动态向下的继承与重载自适应（Delegation Coverage）**：无论内部新增多少个诸如 `LocatorImpl` 的新增代理类，由于工具不仅仅抓取文本，而是抓取整个类图和继承结构，能一次性顺着继承和委托关系将其上下游涉及的参数全部自适应更新完毕。
 3. **Java 编译期强约束（终极防线）**：Python 依赖运行时的补丁完整性检查，而本工具对 `.java` 修改完毕后，会立即交由 CI 上的原版 `mvn compile` 进行全量编译。由于 Java 是极高约束的静态语言，如果此过程中遗漏了任何一个实现类的 `isolatedContext` 同步，或者匹配不完整，**编译器会在打包阶段直接报错抛出 `Method parameters mismatch` 或无法实现接口的致命异常**。这完全消灭了带病上线的可能，成为保证 Patch “没有死角”的最强屏障。

@@ -21,11 +21,18 @@ jobs:
 
       - name: Check for new playwright-java release
         id: check
+        # INPUTS AND THIRD-PARTY TAGS GO THROUGH env AND A STRICT PATTERN, NEVER STRAIGHT INTO THE SCRIPT
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.playwright_version }}
         run: |
-          if [ -n "${{ github.event.inputs.playwright_version }}" ]; then
-            VERSION="${{ github.event.inputs.playwright_version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION=$(curl -s https://api.github.com/repos/Kaliiiiiiiiii-Vinyzu/patchright/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version '$VERSION'" >&2
+            exit 1
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
@@ -58,10 +65,16 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
+      # PLAYWRIGHT 1.63+ ASSEMBLES THE DRIVER WITH npm
+      - name: Set up Node.js LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
       - name: Build and Patch Sources
-        run: |
-          VERSION=${{ needs.check-release.outputs.version }}
-          bash scripts/build.sh "$VERSION" "cc.marbro.patchright" "true"
+        env:
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: bash scripts/build.sh "$VERSION" "cc.marbro.patchright" "true"
 
       - name: Publish to GitHub Packages
         run: |
@@ -80,6 +93,16 @@ jobs:
             Patchright Java v${{ needs.check-release.outputs.version }}
 
             Based on [playwright-java v${{ needs.check-release.outputs.version }}](https://github.com/microsoft/playwright-java/releases/tag/v${{ needs.check-release.outputs.version }})
+
+            ## Installation (JitPack)
+            Add the `https://jitpack.io` repository and:
+            ```xml
+            <dependency>
+              <groupId>com.github.${{ github.repository_owner }}.${{ github.event.repository.name }}</groupId>
+              <artifactId>patchright</artifactId>
+              <version>v${{ needs.check-release.outputs.version }}</version>
+            </dependency>
+            ```
 
             ## Installation (GitHub Packages)
             Add to your `pom.xml`:

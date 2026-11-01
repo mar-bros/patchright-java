@@ -9,6 +9,44 @@
 
 ## Installation
 
+### JitPack
+
+JitPack builds the artifacts straight from this repository and serves them without authentication.
+
+```xml
+<repositories>
+  <repository>
+    <id>jitpack.io</id>
+    <url>https://jitpack.io</url>
+  </repository>
+</repositories>
+
+<dependency>
+  <groupId>com.github.mar-bros.patchright-java</groupId>
+  <artifactId>patchright</artifactId>
+  <version>TAG</version>
+</dependency>
+```
+
+```groovy
+repositories {
+    maven { url 'https://jitpack.io' }
+}
+
+dependencies {
+    implementation 'com.github.mar-bros.patchright-java:patchright:TAG'
+}
+```
+
+`TAG` is a release tag such as `v1.64.0` (its numbers pick the Playwright version), a commit hash or `main-SNAPSHOT` (these build the version pinned by the `playwright-java` submodule). The first request of a version triggers a build of several minutes, so Gradle may need longer timeouts in `gradle.properties`:
+
+```properties
+systemProp.org.gradle.internal.http.connectionTimeout=180000
+systemProp.org.gradle.internal.http.socketTimeout=180000
+```
+
+### GitHub Packages
+
 Add to your `pom.xml`:
 
 ```xml
@@ -19,7 +57,7 @@ Add to your `pom.xml`:
 </dependency>
 ```
 
-Since this is published to GitHub Packages, you'll also need to configure the repository:
+Since this is published to GitHub Packages, you'll also need to configure the repository. GitHub Packages rejects anonymous downloads, so Maven needs a token with the `read:packages` scope for the `github` server in `settings.xml`:
 
 ```xml
 <repositories>
@@ -145,6 +183,8 @@ This repository fully complies with the [official community-driven guidelines](h
 
 ### Building from source
 
+Requires Bash, Git, a JDK, Maven, `curl` or `wget`, `unzip`, `tar` and, for Playwright 1.63 and newer, Node.js with `npm` (the driver is assembled from npm packages).
+
 ```bash
 # Build with specific version
 bash scripts/build.sh 1.52.0
@@ -163,6 +203,7 @@ patchright-java/
 ├── patchright-java-test/      # Integration test module for stealth verification
 ├── playwright-java/           # Submodule tracking official microsoft/playwright-java
 ├── scripts/                   # Build, test, and download automation scripts
+├── jitpack.yml                # JitPack build entry (runs scripts/jitpack.sh)
 ├── pom.xml                    # Root Maven Project (Multi-module)
 ├── README.md
 └── LICENSE

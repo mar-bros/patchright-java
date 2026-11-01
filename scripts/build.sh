@@ -55,7 +55,10 @@ echo "  Group ID: $GROUP_ID"
 echo ""
 echo "[Step 2] Copying sources to patchright-java-release/..."
 rm -rf "$RELEASE_DIR"
-rsync -a --exclude='.git' "$SUBMODULE_DIR/" "$RELEASE_DIR/"
+# PLAIN cp INSTEAD OF rsync, WHICH NEITHER GIT FOR WINDOWS NOR THE JITPACK IMAGE GUARANTEE
+mkdir -p "$RELEASE_DIR"
+cp -a "$SUBMODULE_DIR/." "$RELEASE_DIR/"
+rm -rf "$RELEASE_DIR/.git"
 # add .git to make it easier to diff with original sources after patching
 if [ "$SKIP_COMMIT" != "true" ]; then
   cd "$RELEASE_DIR/" && git init -q && git add . && git commit -q -m "Initial commit"
@@ -66,13 +69,13 @@ echo "  Done."
 echo ""
 echo "[Step 3] Building patcher tool..."
 cd "$PROJECT_DIR/patchright-java-patcher"
-mvn -q package -DskipTests
+mvn -q clean package -DskipTests
 cd "$PROJECT_DIR"
 
 # Step 4: Run patcher
 echo ""
 echo "[Step 4] Running patcher on patchright-java-release/..."
-java -jar $PROJECT_DIR/patchright-java-patcher/target/patchright-java-patcher-*.jar \
+java -jar "$PROJECT_DIR/patchright-java-patcher/target/patchright-java-patcher.jar" \
     "$RELEASE_DIR" \
     "$GROUP_ID" \
     "$PLAYWRIGHT_VERSION"
@@ -87,7 +90,8 @@ bash scripts/download_driver.sh
 echo ""
 echo "[Step 6] Building patchright-java Maven artifacts..."
 cd "$PROJECT_DIR"
-mvn install -DskipTests -Dspotbugs.skip=true -Dcheckstyle.skip=true
+# THE ASSIST MODULE MUST LINK THE VERSION JUST PATCHED, NOT THE ONE IN THE ROOT POM
+mvn -B -ntp install -DskipTests -Dspotbugs.skip=true -Dcheckstyle.skip=true -Dpatchright.version="$PLAYWRIGHT_VERSION"
 
 echo ""
 echo "================================================"

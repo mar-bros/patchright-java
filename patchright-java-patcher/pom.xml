@@ -26,6 +26,8 @@
     </dependencies>
 
     <build>
+        <!-- FIXED NAME SO scripts/build.sh RUNS EXACTLY ONE JAR -->
+        <finalName>patchright-java-patcher</finalName>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
